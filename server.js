@@ -897,3 +897,50 @@ bootstrap().catch((e) => {
   logError("Bootstrap hatası:", e.message);
   process.exit(1);
 });
+
+app.get("/ldap-test", async (req, res) => {
+  try {
+    const client = new Client({
+      url: LDAP_URL,
+      timeout: 10000,
+      connectTimeout: 10000,
+    });
+
+    await client.bind(LDAP_BIND_DN, LDAP_PASSWORD);
+
+    const baseDn = String(req.query.base || LDAP_BASE_DN || "").trim();
+    const filter = String(req.query.filter || LDAP_SEARCH_FILTER || "(objectClass=*)").trim();
+    const attrsRaw = String(req.query.attrs || "cn,telephonenumber,dn").trim();
+    const sizeLimit = Math.min(Number(req.query.limit || 10), 50);
+
+    const attributes = attrsRaw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    const { searchEntries } = await client.search(baseDn, {
+      scope: "sub",
+      filter,
+      attributes,
+      sizeLimit,
+    });
+
+    await client.unbind();
+
+    return res.status(200).json({
+      ok: true,
+      baseDn,
+      filter,
+      attributes,
+      count: searchEntries.length,
+      entries: searchEntries,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message,
+      code: e.code || null,
+      name: e.name || null,
+    });
+  }
+});
