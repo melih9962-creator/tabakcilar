@@ -47,6 +47,7 @@ const LDAP_REFRESH_MS = Number(process.env.LDAP_REFRESH_MS || 5 * 60 * 1000);
 const CONTACTS_FILE = path.join(__dirname, process.env.CONTACTS_FILE || "rehber.csv");
 const CALLS_FILE = path.join(__dirname, process.env.CALLS_FILE || "daily_calls.json");
 const DAILY_CARD_FILE = path.join(__dirname, process.env.DAILY_CARD_FILE || "daily_card_refs.json");
+
 const CALL_STATE_TTL_MS = Number(process.env.CALL_STATE_TTL_MS || 6 * 60 * 60 * 1000);
 
 /* =========================
@@ -122,6 +123,24 @@ function normalizePhone(phone) {
   return digits;
 }
 
+function isMeaningfulPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  return digits.length >= 7;
+}
+
+function cleanDisplayTarget(value, fallback = "-") {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  if (isMeaningfulPhone(raw)) return normalizePhone(raw);
+  return raw;
+}
+
+function sanitizeRecording(value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  return v;
+}
+
 function safeJsonRead(filePath, fallback = {}) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -161,6 +180,7 @@ function isAllowedCallTelegramChat(chatId) {
 function formatDuration(seconds) {
   const s = Number(seconds || 0);
   if (!s) return "0 sn";
+
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
@@ -169,18 +189,13 @@ function formatDuration(seconds) {
   if (h) parts.push(`${h} sa`);
   if (m) parts.push(`${m} dk`);
   if (sec || !parts.length) parts.push(`${sec} sn`);
-  return parts.join(" ");
-}
 
-function sanitizeRecording(value) {
-  const v = String(value || "").trim();
-  if (!v) return "";
-  return v;
+  return parts.join(" ");
 }
 
 function truncateTelegramText(text, max = 3900) {
   if (text.length <= max) return text;
-  return `${text.slice(0, max - 40)}\n\n... liste kısaltıldı ...`;
+  return `${text.slice(0, max - 30)}\n\n... liste kısaltıldı ...`;
 }
 
 function inferDirection(raw = {}) {
@@ -314,6 +329,7 @@ function loadContactsFromCsv() {
       const row = lines[i].split(delimiter);
       const phone = normalizePhone(row[phoneIndex]);
       const name = String(row[nameIndex] || "").trim();
+
       if (phone && name) {
         map[phone] = name;
       }
@@ -359,7 +375,7 @@ async function loadContactsFromLDAP() {
 
       if (!phone || !name) continue;
 
-      // Dahilileri dışla; dış rehber yoksa CSV fallback devreye girsin
+      // Dahili numaraları dışla
       if (/^\d{2,4}$/.test(phone)) continue;
 
       contacts[phone] = name;
@@ -379,7 +395,7 @@ async function refreshContactsSafe() {
     try {
       await loadContactsFromLDAP();
       if (Object.keys(contactMap).length > 0) return;
-      log("LDAP boş döndü, CSV fallback denenecek.");
+      log("LDAP boş döndü, CSV fallback kullanılacak.");
     } catch (e) {
       logError("LDAP rehber yükleme hatası:", e.message);
     }
@@ -393,7 +409,7 @@ function getName(phone) {
 }
 
 /* =========================
-   CALL STORE
+   STORE
 ========================= */
 function loadCallStore() {
   callStore = safeJsonRead(CALLS_FILE, {});
@@ -442,6 +458,7 @@ function upsertCallState(uniqueId, patch) {
     updatedAt: Date.now(),
     answered: false,
     finalized: false,
+    recording: "",
   };
 
   callMap[uniqueId] = {
@@ -464,6 +481,7 @@ function deleteCallState(uniqueId) {
 
 function cleanupStaleState() {
   const now = Date.now();
+
   for (const [uniqueId, state] of Object.entries(callMap)) {
     if (!state?.updatedAt || now - state.updatedAt > CALL_STATE_TTL_MS) {
       delete callMap[uniqueId];
@@ -492,20 +510,18 @@ async function telegramRequest(botToken, method, payload) {
   return data;
 }
 
-async function sendTelegramMessageViaBot(botToken, chatId, text, replyMarkup = null) {
+async function sendTelegramMessageViaBot(botToken, chatId, text) {
   const payload = {
     chat_id: String(chatId),
     text: String(text || ""),
     disable_web_page_preview: true,
   };
 
-  if (replyMarkup) payload.reply_markup = replyMarkup;
-
   const data = await telegramRequest(botToken, "sendMessage", payload);
   return data.result || null;
 }
 
-async function editTelegramMessageViaBot(botToken, chatId, messageId, text, replyMarkup = null) {
+async function editTelegramMessageViaBot(botToken, chatId, messageId, text) {
   const payload = {
     chat_id: String(chatId),
     message_id: Number(messageId),
@@ -513,14 +529,13 @@ async function editTelegramMessageViaBot(botToken, chatId, messageId, text, repl
     disable_web_page_preview: true,
   };
 
-  if (replyMarkup) payload.reply_markup = replyMarkup;
-
   const data = await telegramRequest(botToken, "editMessageText", payload);
   return data.result || null;
 }
 
 async function sendCallTelegram(text, targetChatIds = null) {
   const chatIds = targetChatIds || CALL_TELEGRAM_CHAT_IDS;
+
   if (!CALL_TELEGRAM_BOT_TOKEN || !chatIds.length) {
     log("Call bot aktif değil. Mesaj atlanıyor.");
     return;
@@ -550,6 +565,7 @@ async function answerCallCallback(id, text = "") {
 
 async function clearTelegramWebhook() {
   if (!CALL_TELEGRAM_BOT_TOKEN) return;
+
   try {
     await telegramRequest(CALL_TELEGRAM_BOT_TOKEN, "deleteWebhook", {
       drop_pending_updates: false,
@@ -602,20 +618,712 @@ function buildCallLine(call, index) {
 function summarizeDay(day) {
   const calls = day.calls || [];
 
-  const inboundAnswered = calls.filter((x) => x.direction === "inbound" && x.answered).length;
-  const inboundMissed = calls.filter((x) => x.direction === "inbound" && !x.answered).length;
-  const outboundAnswered = calls.filter((x) => x.direction === "outbound" && x.answered).length;
-  const outboundNoAnswer = calls.filter((x) => x.direction === "outbound" && !x.answered).length;
-  const withRecording = calls.filter((x) => x.recording).length;
-
   return {
     total: calls.length,
-    inboundAnswered,
-    inboundMissed,
-    outboundAnswered,
-    outboundNoAnswer,
-    withRecording,
+    inboundAnswered: calls.filter((x) => x.direction === "inbound" && x.answered).length,
+    inboundMissed: calls.filter((x) => x.direction === "inbound" && !x.answered).length,
+    outboundAnswered: calls.filter((x) => x.direction === "outbound" && x.answered).length,
+    outboundNoAnswer: calls.filter((x) => x.direction === "outbound" && !x.answered).length,
+    withRecording: calls.filter((x) => x.recording).length,
   };
 }
 
 function buildDailyLiveCardText(dateKey, day) {
+  const summary = summarizeDay(day);
+  const calls = [...(day.calls || [])].sort((a, b) => a.startAt - b.startAt);
+
+  const lines = [
+    `📋 Günlük Çağrı Kartı`,
+    `📅 Tarih: ${dateKey}`,
+    ``,
+    `Toplam: ${summary.total}`,
+    `📥 Inbound cevaplanan: ${summary.inboundAnswered}`,
+    `📥 Inbound kaçan: ${summary.inboundMissed}`,
+    `📤 Outbound görüşülen: ${summary.outboundAnswered}`,
+    `📤 Outbound cevapsız: ${summary.outboundNoAnswer}`,
+    `🎧 Ses kaydı olan: ${summary.withRecording}`,
+    ``,
+  ];
+
+  if (!calls.length) {
+    lines.push("Bugün henüz çağrı yok.");
+  } else {
+    calls.forEach((call, i) => {
+      lines.push(buildCallLine(call, i));
+      lines.push("");
+    });
+  }
+
+  return truncateTelegramText(lines.join("\n"));
+}
+
+function buildFinalReportText(dateKey, day) {
+  const summary = summarizeDay(day);
+  const calls = [...(day.calls || [])].sort((a, b) => a.startAt - b.startAt);
+
+  const lines = [
+    `📊 Gün Sonu Çağrı Raporu`,
+    `📅 Tarih: ${dateKey}`,
+    ``,
+    `Toplam görüşme: ${summary.total}`,
+    `📥 Inbound cevaplanan: ${summary.inboundAnswered}`,
+    `📥 Inbound kaçan: ${summary.inboundMissed}`,
+    `📤 Outbound görüşülen: ${summary.outboundAnswered}`,
+    `📤 Outbound cevapsız: ${summary.outboundNoAnswer}`,
+    `🎧 Ses kaydı olan: ${summary.withRecording}`,
+    ``,
+    `Detaylar:`,
+    ``,
+  ];
+
+  if (!calls.length) {
+    lines.push("Bugün çağrı kaydı yok.");
+  } else {
+    calls.forEach((call, i) => {
+      lines.push(buildCallLine(call, i));
+      lines.push("");
+    });
+  }
+
+  return truncateTelegramText(lines.join("\n"));
+}
+
+/* =========================
+   DAILY CARD
+========================= */
+async function sendOrUpdateDailyLiveCard(dateKey) {
+  const day = ensureDayStore(dateKey);
+  const text = buildDailyLiveCardText(dateKey, day);
+  const dayRefs = ensureDailyCardRef(dateKey);
+
+  for (const chatId of CALL_TELEGRAM_CHAT_IDS) {
+    const ref = dayRefs[String(chatId)];
+
+    try {
+      if (ref?.messageId) {
+        await editTelegramMessageViaBot(
+          CALL_TELEGRAM_BOT_TOKEN,
+          chatId,
+          ref.messageId,
+          text
+        );
+      } else {
+        const sent = await sendTelegramMessageViaBot(
+          CALL_TELEGRAM_BOT_TOKEN,
+          chatId,
+          text
+        );
+
+        if (sent?.message_id) {
+          dayRefs[String(chatId)] = {
+            messageId: sent.message_id,
+            updatedAt: Date.now(),
+          };
+        }
+      }
+    } catch (e) {
+      logError(`Günlük kart gönder/güncelle hatası -> chat_id=${chatId}:`, e.message);
+
+      try {
+        const sent = await sendTelegramMessageViaBot(
+          CALL_TELEGRAM_BOT_TOKEN,
+          chatId,
+          text
+        );
+
+        if (sent?.message_id) {
+          dayRefs[String(chatId)] = {
+            messageId: sent.message_id,
+            updatedAt: Date.now(),
+          };
+        }
+      } catch (inner) {
+        logError(`Fallback günlük kart gönderim hatası -> chat_id=${chatId}:`, inner.message);
+      }
+    }
+  }
+
+  saveDailyCardRefs();
+}
+
+async function sendFinalReportIfDue() {
+  const now = await getTurkeyNowDate();
+  const hour = now.getUTCHours();
+  const minute = now.getUTCMinutes();
+
+  if (hour !== REPORT_HOUR || minute !== REPORT_MINUTE) {
+    return;
+  }
+
+  const dateKey = await getDateKeyInTurkey();
+  const day = ensureDayStore(dateKey);
+
+  if (day.finalReportSent) {
+    return;
+  }
+
+  const text = buildFinalReportText(dateKey, day);
+  await sendCallTelegram(text);
+
+  day.finalReportSent = true;
+  day.finalReportSentAt = Date.now();
+  saveCallStore();
+
+  log("Gün sonu raporu gönderildi:", dateKey);
+}
+
+function startDailyReportScheduler() {
+  setInterval(async () => {
+    try {
+      await sendFinalReportIfDue();
+    } catch (e) {
+      logError("Gün sonu rapor scheduler hatası:", e.message);
+    }
+  }, 30 * 1000);
+
+  log(`Gün sonu rapor scheduler aktif: ${REPORT_HOUR}:${pad2(REPORT_MINUTE)} (${REPORT_TIMEZONE})`);
+}
+
+/* =========================
+   FINALIZE CALL
+========================= */
+function dedupeExistingCall(day, key) {
+  return (day.calls || []).find((x) => x.key === key);
+}
+
+async function finalizeCallRecord(source, patch = {}) {
+  const uniqueId = String(
+    patch.uniqueId ||
+      source.uniqueId ||
+      source.asteriskId ||
+      source.unique_id ||
+      ""
+  ).trim();
+
+  if (!uniqueId) return;
+  if (finalizedCallLocks.has(uniqueId)) return;
+
+  finalizedCallLocks.add(uniqueId);
+
+  try {
+    const state = getCallState(uniqueId) || {};
+    if (state.finalized) return;
+
+    const direction = patch.direction || state.type || inferDirection(source);
+
+    const callerRaw = String(
+      patch.caller ||
+        source.caller ||
+        source.arayan ||
+        (direction === "inbound" ? source.customer_num : source.internal_num) ||
+        ""
+    ).trim();
+
+    const calleeRaw = String(
+      patch.callee ||
+        source.callee ||
+        source.aranan ||
+        source.customer_num ||
+        source.incoming_number ||
+        source.santral ||
+        ""
+    ).trim();
+
+    const caller = isMeaningfulPhone(callerRaw) ? normalizePhone(callerRaw) : callerRaw || "-";
+    const callee = cleanDisplayTarget(calleeRaw, "-");
+
+    const internal = String(
+      patch.internal ||
+        source.internal_num ||
+        state.internal ||
+        ""
+    ).trim() || "-";
+
+    const talkTime = Number(patch.talkTime ?? source.talktime ?? source.sure ?? 0);
+    const holdTime = Number(patch.holdTime ?? source.holdtime ?? 0);
+
+    const answered =
+      typeof patch.answered === "boolean"
+        ? patch.answered
+        : Boolean(state.answered || talkTime > 0 || String(source.callConnectedTime || "") !== "");
+
+    const startAt = Number(
+      patch.startAt ||
+        source.callInitiatedTime ||
+        state.createdAt ||
+        Date.now()
+    );
+
+    const endAt = Number(
+      patch.endAt ||
+        source.callEndedTime ||
+        source.timestamp ||
+        Date.now()
+    );
+
+    const recording = sanitizeRecording(
+      patch.recording ||
+        source.seskaydi ||
+        state.recording ||
+        ""
+    );
+
+    let externalTarget = "";
+    if (direction === "inbound") {
+      externalTarget = normalizePhone(source.customer_num || callerRaw || "");
+    } else if (direction === "outbound") {
+      externalTarget = normalizePhone(source.customer_num || calleeRaw || "");
+    }
+
+    const contactName = getName(externalTarget);
+
+    const dateKey = await getDateKeyInTurkey();
+    const day = ensureDayStore(dateKey);
+
+    const record = {
+      key: uniqueId,
+      uniqueId,
+      direction,
+      answered,
+      caller,
+      callee,
+      internal,
+      talkTime,
+      holdTime,
+      startAt,
+      endAt,
+      recording,
+      contactName,
+      rawScenario: String(source.scenario || patch.rawScenario || ""),
+      updatedAt: Date.now(),
+    };
+
+    const existing = dedupeExistingCall(day, uniqueId);
+    if (existing) {
+      Object.assign(existing, record);
+    } else {
+      day.calls.push(record);
+    }
+
+    saveCallStore();
+
+    upsertCallState(uniqueId, {
+      ...state,
+      finalized: true,
+      recording,
+    });
+
+    await sendOrUpdateDailyLiveCard(dateKey);
+
+    log("Çağrı finalize edildi:", {
+      uniqueId,
+      direction,
+      answered,
+      caller: record.caller,
+      callee: record.callee,
+      internal: record.internal,
+      recording: Boolean(recording),
+    });
+  } catch (e) {
+    logError("finalizeCallRecord hatası:", e.message);
+  } finally {
+    finalizedCallLocks.delete(uniqueId);
+  }
+}
+
+/* =========================
+   TELEGRAM COMMANDS
+========================= */
+async function processCallTelegramMessage(update) {
+  const message = update.message;
+  if (!message) return;
+
+  const chatId = String(message.chat.id);
+  const text = String(message.text || "").trim();
+
+  if (!isAllowedCallTelegramChat(chatId)) return;
+  if (!text) return;
+
+  if (text === "/help") {
+    await sendCallTelegram(
+      "Komutlar:\n\n" +
+        "/help\n" +
+        "/today_card\n" +
+        "/today_report\n" +
+        "/yesterday_report\n" +
+        "/reload_contacts\n\n" +
+        "/today_card -> bugünün canlı kartını yeniden yollar\n" +
+        "/today_report -> bugünün detay raporu\n" +
+        "/yesterday_report -> dünün detay raporu\n" +
+        "/reload_contacts -> rehberi yeniden yükler",
+      [chatId]
+    );
+    return;
+  }
+
+  if (text === "/reload_contacts") {
+    await refreshContactsSafe();
+    await sendCallTelegram("✅ Rehber yeniden yüklendi.", [chatId]);
+    return;
+  }
+
+  if (text === "/today_card") {
+    const dateKey = await getDateKeyInTurkey();
+    const day = ensureDayStore(dateKey);
+    await sendCallTelegram(buildDailyLiveCardText(dateKey, day), [chatId]);
+    return;
+  }
+
+  if (text === "/today_report") {
+    const dateKey = await getDateKeyInTurkey();
+    const day = ensureDayStore(dateKey);
+    await sendCallTelegram(buildFinalReportText(dateKey, day), [chatId]);
+    return;
+  }
+
+  if (text === "/yesterday_report") {
+    const dateKey = await getDateKeyDaysAgoTurkey(1);
+    const day = ensureDayStore(dateKey);
+    await sendCallTelegram(buildFinalReportText(dateKey, day), [chatId]);
+    return;
+  }
+}
+
+async function processCallTelegramCallback(update) {
+  const callback = update.callback_query;
+  if (!callback) return;
+  await answerCallCallback(callback.id);
+}
+
+/* =========================
+   TELEGRAM POLLING
+========================= */
+async function checkTelegram(botName, botToken, state, onUpdate) {
+  if (!botToken) return;
+
+  const url = `https://api.telegram.org/bot${botToken}/getUpdates?offset=${state.offset}&timeout=20`;
+
+  const response = await fetch(url);
+  const data = await response.json().catch(() => ({}));
+
+  if (!data.ok) {
+    if (data.error_code === 409) {
+      logError(`${botName} update hatası: aynı bot başka instance tarafından kullanılıyor.`);
+      return;
+    }
+
+    logError(`${botName} update hatası:`, data);
+    return;
+  }
+
+  const updates = data.result || [];
+
+  for (const update of updates) {
+    if (state.processedUpdateIds.has(update.update_id)) continue;
+
+    state.processedUpdateIds.add(update.update_id);
+
+    if (state.processedUpdateIds.size > 1000) {
+      const first = state.processedUpdateIds.values().next().value;
+      state.processedUpdateIds.delete(first);
+    }
+
+    state.offset = update.update_id + 1;
+
+    try {
+      await onUpdate(update);
+    } catch (e) {
+      logError(`${botName} update işleme hatası:`, e.message);
+    }
+  }
+}
+
+async function startBotPolling(botName, botToken, state, onUpdate) {
+  if (!botToken) {
+    log(`${botName} polling başlatılmadı: token yok.`);
+    return;
+  }
+
+  while (true) {
+    try {
+      await checkTelegram(botName, botToken, state, onUpdate);
+    } catch (e) {
+      logError(`${botName} polling hata:`, e.message);
+      await sleep(2000);
+    }
+  }
+}
+
+async function handleCallBotUpdate(update) {
+  if (update.message) await processCallTelegramMessage(update);
+  if (update.callback_query) await processCallTelegramCallback(update);
+}
+
+/* =========================
+   REQUEST LOGGING
+========================= */
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+
+  if (req.path !== "/health") {
+    log("HTTP IN", {
+      method: req.method,
+      url: req.originalUrl,
+      ip: req.ip || req.headers["x-forwarded-for"] || "",
+      query: req.query || {},
+      body: req.body || {},
+    });
+  }
+
+  res.on("finish", () => {
+    if (req.path !== "/health") {
+      log("HTTP OUT", {
+        method: req.method,
+        url: req.originalUrl,
+        status: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+  });
+
+  next();
+});
+
+/* =========================
+   HEALTH / SELF PING
+========================= */
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
+
+function startSelfPing() {
+  if (!ENABLE_SELF_PING) {
+    log("Self-ping kapalı.");
+    return;
+  }
+
+  if (!APP_BASE_URL) {
+    log("Self-ping başlatılmadı: APP_BASE_URL yok.");
+    return;
+  }
+
+  const target = `${APP_BASE_URL}/health`;
+
+  setInterval(async () => {
+    try {
+      const response = await fetch(target, { method: "GET" });
+      log(`Self-ping -> ${response.status}`);
+    } catch (e) {
+      logError("Self-ping hatası:", e.message);
+    }
+  }, SELF_PING_INTERVAL_MS);
+
+  log("Self-ping aktif:", target, "intervalMs:", SELF_PING_INTERVAL_MS);
+}
+
+/* =========================
+   DEBUG
+========================= */
+app.all("/call-webhook-test", (req, res) => {
+  log("========== SANTRAL WEBHOOK TEST ==========");
+  log("METHOD:", req.method);
+  log("QUERY:", req.query);
+  log("BODY:", req.body);
+  log("=========================================");
+  res.status(200).json({ ok: true });
+});
+
+/* =========================
+   WEBHOOK
+========================= */
+app.post("/call-webhook", async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const data = req.body || {};
+    const scenario = String(data.scenario || "").trim();
+    const uniqueId = String(data.unique_id || data.asteriskId || "").trim();
+
+    log("Çağrı webhook event:", data);
+
+    if (!scenario || !uniqueId) {
+      log("Çağrı webhook atlandı: scenario veya unique_id eksik.");
+      return;
+    }
+
+    if (scenario === "Outbound_call") {
+      upsertCallState(uniqueId, {
+        type: "outbound",
+        phone: normalizePhone(data.customer_num || data.aranan || ""),
+        internal: String(data.internal_num || "").trim(),
+        answered: false,
+        recording: "",
+      });
+      return;
+    }
+
+    if (scenario === "InboundtoPBX" || scenario === "Inbound_call" || scenario === "Queue") {
+      upsertCallState(uniqueId, {
+        type: "inbound",
+        phone: normalizePhone(data.customer_num || data.aranan || data.incoming_number || ""),
+        internal: String(data.internal_num || "").trim(),
+        answered: false,
+        recording: "",
+      });
+      return;
+    }
+
+    if (scenario === "Answer") {
+      const current = getCallState(uniqueId);
+
+      upsertCallState(uniqueId, {
+        type: current?.type || inferDirection(data),
+        phone: current?.phone || normalizePhone(data.customer_num || data.aranan || ""),
+        internal: current?.internal || String(data.internal_num || "").trim(),
+        answered: true,
+      });
+      return;
+    }
+
+    if (scenario === "Hangup") {
+      const state = getCallState(uniqueId);
+      const direction = state?.type || inferDirection(data);
+
+      await finalizeCallRecord(
+        {
+          ...data,
+          uniqueId,
+        },
+        {
+          direction,
+          answered: Boolean(state?.answered || Number(data.talktime || 0) > 0),
+          caller:
+            direction === "inbound"
+              ? (data.customer_num || data.arayan || "")
+              : (data.internal_num || data.arayan || ""),
+          callee:
+            direction === "inbound"
+              ? (data.incoming_number || data.santral || data.aranan || "")
+              : (data.customer_num || data.aranan || ""),
+          internal: data.internal_num || state?.internal || "",
+          talkTime: Number(data.talktime || 0),
+          holdTime: Number(data.holdtime || 0),
+          endAt: Number(data.timestamp || Date.now()),
+          rawScenario: "Hangup",
+        }
+      );
+
+      deleteCallState(uniqueId);
+      return;
+    }
+
+    if (scenario === "cdr") {
+      const direction =
+        String(data.yon || "") === "1"
+          ? "inbound"
+          : String(data.yon || "") === "2"
+          ? "outbound"
+          : inferDirection(data);
+
+      const caller =
+        direction === "inbound"
+          ? normalizePhone(data.arayan || "") || String(data.arayan || "").trim()
+          : normalizePhone(data.arayan || "") || String(data.arayan || "").trim();
+
+      const callee =
+        direction === "inbound"
+          ? cleanDisplayTarget(data.santral || data.incoming_number || data.aranan || "")
+          : cleanDisplayTarget(data.aranan || "");
+
+      const internal =
+        direction === "outbound"
+          ? String(data.arayan || "").trim()
+          : String(data.internal_num || "").trim();
+
+      await finalizeCallRecord(
+        {
+          ...data,
+          uniqueId,
+        },
+        {
+          direction,
+          answered: Number(data.sure || 0) > 0 || String(data.callConnectedTime || "") !== "",
+          caller,
+          callee,
+          internal,
+          talkTime: Number(data.sure || 0),
+          holdTime: Number(data.holdtime || 0),
+          startAt: Number(data.callInitiatedTime || Date.now()),
+          endAt: Number(data.callEndedTime || Date.now()),
+          recording: sanitizeRecording(data.seskaydi || ""),
+          rawScenario: "cdr",
+        }
+      );
+
+      deleteCallState(uniqueId);
+      return;
+    }
+
+    if (scenario === "QueueLeave") {
+      log("QueueLeave event alındı:", data);
+      return;
+    }
+  } catch (e) {
+    logError("Çağrı webhook işleme hatası:", e.message);
+  }
+});
+
+/* =========================
+   ERROR CAPTURE
+========================= */
+process.on("uncaughtException", (err) => {
+  logError("uncaughtException:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logError("unhandledRejection:", reason);
+});
+
+/* =========================
+   START
+========================= */
+async function bootstrap() {
+  ensureEnv();
+
+  loadCallStore();
+  loadDailyCardRefs();
+
+  await refreshTurkeyTimeOffset();
+  await refreshContactsSafe();
+  await clearTelegramWebhook();
+
+  setInterval(cleanupStaleState, 10 * 60 * 1000);
+  setInterval(refreshContactsSafe, LDAP_REFRESH_MS);
+  setInterval(async () => {
+    try {
+      await refreshTurkeyTimeOffset();
+    } catch (e) {
+      logError("Türkiye saat refresh hatası:", e.message);
+    }
+  }, 5 * 60 * 1000);
+
+  startDailyReportScheduler();
+
+  app.listen(PORT, "0.0.0.0", () => {
+    log(`Server çalışıyor: http://0.0.0.0:${PORT}`);
+
+    startSelfPing();
+
+    startBotPolling(
+      "Call bot",
+      CALL_TELEGRAM_BOT_TOKEN,
+      botPollingState.call,
+      handleCallBotUpdate
+    );
+  });
+}
+
+bootstrap().catch((e) => {
+  logError("Bootstrap hatası:", e.message);
+  process.exit(1);
+});
