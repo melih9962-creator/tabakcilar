@@ -192,7 +192,7 @@ async function loadContactsFromLDAP() {
     const { searchEntries } = await client.search(LDAP_BASE_DN, {
       scope: "sub",
       filter: LDAP_SEARCH_FILTER,
-      attributes: [LDAP_NAME_ATTR, LDAP_PHONE_ATTR],
+      attributes: ["*"],
     });
 
     for (const entry of searchEntries) {
