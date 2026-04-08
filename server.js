@@ -944,3 +944,42 @@ app.get("/ldap-test", async (req, res) => {
     });
   }
 });
+
+
+/* =========================
+   e tablo için
+========================= */
+
+app.get("/ldap-rootdse", async (req, res) => {
+  try {
+    const client = new Client({
+      url: LDAP_URL,
+      timeout: 10000,
+      connectTimeout: 10000,
+    });
+
+    await client.bind(LDAP_BIND_DN, LDAP_PASSWORD);
+
+    const { searchEntries } = await client.search("", {
+      scope: "base",
+      filter: "(objectClass=*)",
+      attributes: ["namingContexts", "defaultNamingContext", "subschemaSubentry"],
+      sizeLimit: 1,
+    });
+
+    await client.unbind();
+
+    return res.json({
+      ok: true,
+      count: searchEntries.length,
+      entries: searchEntries,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message,
+      code: e.code || null,
+      name: e.name || null,
+    });
+  }
+});
