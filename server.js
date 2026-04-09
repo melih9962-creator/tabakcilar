@@ -47,6 +47,7 @@ const LDAP_REFRESH_MS = Number(process.env.LDAP_REFRESH_MS || 5 * 60 * 1000);
 const CONTACTS_FILE = path.join(__dirname, process.env.CONTACTS_FILE || "rehber.csv");
 const CALLS_FILE = path.join(__dirname, process.env.CALLS_FILE || "daily_calls.json");
 const DAILY_CARD_FILE = path.join(__dirname, process.env.DAILY_CARD_FILE || "daily_card_refs.json");
+const CALL_TASKS_FILE = path.join(__dirname, process.env.CALL_TASKS_FILE || "call_tasks.json");
 
 const CALL_STATE_TTL_MS = Number(process.env.CALL_STATE_TTL_MS || 6 * 60 * 60 * 1000);
 
@@ -56,6 +57,7 @@ const CALL_STATE_TTL_MS = Number(process.env.CALL_STATE_TTL_MS || 6 * 60 * 60 * 
 let contactMap = {};
 let callStore = {};
 let dailyCardRefs = {};
+let callTasksMap = {};
 
 const callMap = {};
 const finalizedCallLocks = new Set();
@@ -70,7 +72,6 @@ const botPollingState = {
 let turkeyTimeCache = {
   lastOkMs: 0,
   offsetMs: 0,
-  source: "init",
 };
 
 /* =========================
@@ -189,13 +190,19 @@ function formatDuration(seconds) {
   if (h) parts.push(`${h} sa`);
   if (m) parts.push(`${m} dk`);
   if (sec || !parts.length) parts.push(`${sec} sn`);
-
   return parts.join(" ");
 }
 
-function truncateTelegramText(text, max = 3900) {
+function truncateText(text, max = 3900) {
   if (text.length <= max) return text;
-  return `${text.slice(0, max - 30)}\n\n... liste kısaltıldı ...`;
+  return `${text.slice(0, max - 24)}\n\n... kısaltıldı ...`;
+}
+
+function escapeHtml(input) {
+  return String(input ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function inferDirection(raw = {}) {
@@ -207,6 +214,14 @@ function inferDirection(raw = {}) {
   if (yon === "2") return "outbound";
   if (yon === "1") return "inbound";
   return "unknown";
+}
+
+function formatTelegramUser(user) {
+  if (!user) return "Bilinmiyor";
+  const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+  if (fullName) return fullName;
+  if (user.username) return `@${user.username}`;
+  return String(user.id || "Bilinmiyor");
 }
 
 /* =========================
@@ -235,7 +250,6 @@ async function refreshTurkeyTimeOffset() {
     const turkeyUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
     turkeyTimeCache.offsetMs = turkeyUtcMs - Date.now();
     turkeyTimeCache.lastOkMs = Date.now();
-    turkeyTimeCache.source = "web";
 
     log("Türkiye saati webden güncellendi.");
     return true;
@@ -369,8 +383,14 @@ async function loadContactsFromLDAP() {
       const rawName = entry[LDAP_NAME_ATTR];
       const rawPhone = entry[LDAP_PHONE_ATTR];
 
-      const name = Array.isArray(rawName) ? String(rawName[0] || "").trim() : String(rawName || "").trim();
-      const phoneValue = Array.isArray(rawPhone) ? String(rawPhone[0] || "") : String(rawPhone || "");
+      const name = Array.isArray(rawName)
+        ? String(rawName[0] || "").trim()
+        : String(rawName || "").trim();
+
+      const phoneValue = Array.isArray(rawPhone)
+        ? String(rawPhone[0] || "")
+        : String(rawPhone || "");
+
       const phone = normalizePhone(phoneValue);
 
       if (!phone || !name) continue;
@@ -447,6 +467,15 @@ function ensureDailyCardRef(dateKey) {
   return dailyCardRefs[dateKey];
 }
 
+function loadCallTasks() {
+  callTasksMap = safeJsonRead(CALL_TASKS_FILE, {});
+  log(`Çağrı görevleri yüklendi. Kayıt sayısı: ${Object.keys(callTasksMap).length}`);
+}
+
+function saveCallTasks() {
+  safeJsonWrite(CALL_TASKS_FILE, callTasksMap);
+}
+
 /* =========================
    CALL STATE
 ========================= */
@@ -510,30 +539,36 @@ async function telegramRequest(botToken, method, payload) {
   return data;
 }
 
-async function sendTelegramMessageViaBot(botToken, chatId, text) {
+async function sendTelegramMessageViaBot(botToken, chatId, text, replyMarkup = null, parseMode = "HTML") {
   const payload = {
     chat_id: String(chatId),
     text: String(text || ""),
     disable_web_page_preview: true,
+    parse_mode: parseMode,
   };
+
+  if (replyMarkup) payload.reply_markup = replyMarkup;
 
   const data = await telegramRequest(botToken, "sendMessage", payload);
   return data.result || null;
 }
 
-async function editTelegramMessageViaBot(botToken, chatId, messageId, text) {
+async function editTelegramMessageViaBot(botToken, chatId, messageId, text, replyMarkup = null, parseMode = "HTML") {
   const payload = {
     chat_id: String(chatId),
     message_id: Number(messageId),
     text: String(text || ""),
     disable_web_page_preview: true,
+    parse_mode: parseMode,
   };
+
+  if (replyMarkup) payload.reply_markup = replyMarkup;
 
   const data = await telegramRequest(botToken, "editMessageText", payload);
   return data.result || null;
 }
 
-async function sendCallTelegram(text, targetChatIds = null) {
+async function sendCallTelegram(text, targetChatIds = null, replyMarkup = null, parseMode = "HTML") {
   const chatIds = targetChatIds || CALL_TELEGRAM_CHAT_IDS;
 
   if (!CALL_TELEGRAM_BOT_TOKEN || !chatIds.length) {
@@ -543,7 +578,7 @@ async function sendCallTelegram(text, targetChatIds = null) {
 
   for (const chatId of chatIds) {
     try {
-      await sendTelegramMessageViaBot(CALL_TELEGRAM_BOT_TOKEN, chatId, text);
+      await sendTelegramMessageViaBot(CALL_TELEGRAM_BOT_TOKEN, chatId, text, replyMarkup, parseMode);
       log(`Call bot mesaj gönderildi -> chat_id=${chatId}`);
     } catch (e) {
       logError(`Call bot gönderim hatası -> chat_id=${chatId}:`, e.message);
@@ -577,6 +612,206 @@ async function clearTelegramWebhook() {
 }
 
 /* =========================
+   RECORDING LINKS
+========================= */
+function buildRecordingListenUrl(callUniqueId) {
+  if (!APP_BASE_URL || !callUniqueId) return "";
+  return `${APP_BASE_URL}/recording/${encodeURIComponent(callUniqueId)}`;
+}
+
+function buildRecordingHtml(callUniqueId) {
+  const url = buildRecordingListenUrl(callUniqueId);
+  if (!url) return "🎧 Kayıt: mevcut";
+  return `🎧 <a href="${escapeHtml(url)}">Dinle</a>`;
+}
+
+/* =========================
+   MISSED CALL TASKS
+========================= */
+async function getTaskKeyByPhoneAndDay(phone) {
+  const normalizedPhone = normalizePhone(phone);
+  const dateKey = await getDateKeyInTurkey();
+  return `${normalizedPhone}_${dateKey}`;
+}
+
+function getTaskStatusLabel(status) {
+  switch (status) {
+    case "done":
+      return "✅ Geri Arandı";
+    case "later":
+      return "⏰ Daha Sonra";
+    case "ignore":
+      return "🚫 Gereksiz";
+    case "open":
+    default:
+      return "🟥 Açık";
+  }
+}
+
+function buildMissedCallTaskText(task) {
+  const lines = [
+    "📞 <b>Kaçan çağrı</b>",
+    "",
+    `Durum: ${escapeHtml(getTaskStatusLabel(task.status))}`,
+    `👤 ${escapeHtml(task.name || "Kayıtlı değil")}`,
+    `📱 ${escapeHtml(task.phone || "-")}`,
+    `🔁 Bugün ulaşamama sayısı: ${escapeHtml(String(task.missedCount || 1))}`,
+    `🕒 İlk çağrı: ${escapeHtml(formatDateTimeTR(task.createdAt))}`,
+    `⏱ Son arama: ${escapeHtml(formatDateTimeTR(task.lastCallAt || task.createdAt))}`,
+  ];
+
+  if (task.lastRecordingUniqueId) {
+    lines.push(buildRecordingHtml(task.lastRecordingUniqueId));
+  } else {
+    lines.push("🎧 Kayıt: yok");
+  }
+
+  if (task.updatedBy) {
+    lines.push(`🙋 Güncelleyen: ${escapeHtml(task.updatedBy)}`);
+  }
+
+  if (task.updatedAt && task.updatedAt !== task.createdAt) {
+    lines.push(`📝 Son Güncelleme: ${escapeHtml(formatDateTimeTR(task.updatedAt))}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildMissedCallTaskKeyboard(task) {
+  const current = task.status || "open";
+  const label = (status, text) => (current === status ? `• ${text}` : text);
+
+  return {
+    inline_keyboard: [
+      [
+        { text: label("done", "✅ Geri Arandı"), callback_data: `calltask|done|${task.id}` },
+        { text: label("later", "⏰ Daha Sonra"), callback_data: `calltask|later|${task.id}` },
+      ],
+      [
+        { text: label("ignore", "🚫 Gereksiz"), callback_data: `calltask|ignore|${task.id}` },
+        { text: label("open", "🟥 Açık"), callback_data: `calltask|open|${task.id}` },
+      ],
+    ],
+  };
+}
+
+async function createOrUpdateDailyMissedCallTask(phone, sourceUniqueId, extra = {}) {
+  const taskId = await getTaskKeyByPhoneAndDay(phone);
+  const normalizedPhone = normalizePhone(phone);
+
+  if (callTasksMap[taskId]) {
+    const existing = callTasksMap[taskId];
+    existing.sourceUniqueIds = Array.isArray(existing.sourceUniqueIds) ? existing.sourceUniqueIds : [];
+
+    const alreadySeen = sourceUniqueId && existing.sourceUniqueIds.includes(sourceUniqueId);
+    if (!alreadySeen) {
+      existing.missedCount = (existing.missedCount || 1) + 1;
+      if (sourceUniqueId) existing.sourceUniqueIds.push(sourceUniqueId);
+    }
+
+    existing.lastCallAt = Date.now();
+    existing.updatedAt = Date.now();
+    existing.name = getName(normalizedPhone);
+
+    if (extra.lastRecordingUniqueId) {
+      existing.lastRecordingUniqueId = extra.lastRecordingUniqueId;
+    }
+
+    saveCallTasks();
+    return { task: existing, created: !alreadySeen && (existing.missedCount || 1) === 1, changed: !alreadySeen };
+  }
+
+  const task = {
+    id: taskId,
+    phone: normalizedPhone,
+    name: getName(normalizedPhone),
+    status: "open",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    lastCallAt: Date.now(),
+    updatedBy: null,
+    missedCount: 1,
+    messageRefs: [],
+    type: "missed_call_daily",
+    lastRecordingUniqueId: extra.lastRecordingUniqueId || "",
+    sourceUniqueIds: sourceUniqueId ? [sourceUniqueId] : [],
+  };
+
+  callTasksMap[taskId] = task;
+  saveCallTasks();
+  return { task, created: true, changed: true };
+}
+
+async function sendMissedCallTaskNotifications(task) {
+  if (!CALL_TELEGRAM_BOT_TOKEN || !CALL_TELEGRAM_CHAT_IDS.length) {
+    log("Call bot pasif; missed call görevi gönderilmedi.");
+    return;
+  }
+
+  const text = buildMissedCallTaskText(task);
+  const keyboard = buildMissedCallTaskKeyboard(task);
+
+  if (!task.messageRefs?.length) {
+    for (const chatId of CALL_TELEGRAM_CHAT_IDS) {
+      try {
+        const result = await sendTelegramMessageViaBot(
+          CALL_TELEGRAM_BOT_TOKEN,
+          chatId,
+          text,
+          keyboard,
+          "HTML"
+        );
+
+        if (result?.message_id) {
+          task.messageRefs.push({
+            chatId: String(chatId),
+            messageId: result.message_id,
+          });
+        }
+      } catch (e) {
+        logError(`Missed call task gönderim hatası -> chat_id=${chatId}:`, e.message);
+      }
+    }
+
+    task.updatedAt = Date.now();
+    saveCallTasks();
+    return;
+  }
+
+  await syncMissedCallTaskMessages(task);
+}
+
+async function syncMissedCallTaskMessages(task) {
+  if (!task?.messageRefs?.length) {
+    saveCallTasks();
+    return;
+  }
+
+  const text = buildMissedCallTaskText(task);
+  const keyboard = buildMissedCallTaskKeyboard(task);
+
+  for (const ref of task.messageRefs) {
+    try {
+      await editTelegramMessageViaBot(
+        CALL_TELEGRAM_BOT_TOKEN,
+        ref.chatId,
+        ref.messageId,
+        text,
+        keyboard,
+        "HTML"
+      );
+    } catch (e) {
+      logError(
+        `Missed call task mesaj güncelleme hatası -> chat_id=${ref.chatId}, message_id=${ref.messageId}:`,
+        e.message
+      );
+    }
+  }
+
+  saveCallTasks();
+}
+
+/* =========================
    CARD BUILDERS
 ========================= */
 function getCallStatusLabel(call) {
@@ -594,22 +829,22 @@ function getDirectionLabel(direction) {
 
 function buildCallLine(call, index) {
   const lines = [
-    `${index + 1}) ${getDirectionLabel(call.direction)} | ${getCallStatusLabel(call)} | ${formatOnlyTimeTR(call.startAt)}`,
-    `👤 ${call.contactName || "Kayıtlı değil"}`,
-    `📞 Arayan: ${call.caller || "-"}`,
-    `📲 Aranan: ${call.callee || "-"}`,
-    `🏢 Dahili: ${call.internal || "-"}`,
-    `⏱ Süre: ${formatDuration(call.talkTime)}`,
+    `${index + 1}) ${escapeHtml(getDirectionLabel(call.direction))} | ${escapeHtml(getCallStatusLabel(call))} | ${escapeHtml(formatOnlyTimeTR(call.startAt))}`,
+    `👤 ${escapeHtml(call.contactName || "Kayıtlı değil")}`,
+    `📞 Arayan: ${escapeHtml(call.caller || "-")}`,
+    `📲 Aranan: ${escapeHtml(call.callee || "-")}`,
+    `🏢 Dahili: ${escapeHtml(call.internal || "-")}`,
+    `⏱ Süre: ${escapeHtml(formatDuration(call.talkTime))}`,
   ];
 
   if (call.holdTime) {
-    lines.push(`⏸ Bekleme: ${formatDuration(call.holdTime)}`);
+    lines.push(`⏸ Bekleme: ${escapeHtml(formatDuration(call.holdTime))}`);
   }
 
   if (call.recording) {
-    lines.push(`🎧 Kayıt: ${call.recording}`);
+    lines.push(buildRecordingHtml(call.uniqueId));
   } else {
-    lines.push(`🎧 Kayıt: yok`);
+    lines.push("🎧 Kayıt: yok");
   }
 
   return lines.join("\n");
@@ -633,15 +868,15 @@ function buildDailyLiveCardText(dateKey, day) {
   const calls = [...(day.calls || [])].sort((a, b) => a.startAt - b.startAt);
 
   const lines = [
-    `📋 Günlük Çağrı Kartı`,
-    `📅 Tarih: ${dateKey}`,
+    `📋 <b>Günlük Çağrı Kartı</b>`,
+    `📅 Tarih: ${escapeHtml(dateKey)}`,
     ``,
-    `Toplam: ${summary.total}`,
-    `📥 Inbound cevaplanan: ${summary.inboundAnswered}`,
-    `📥 Inbound kaçan: ${summary.inboundMissed}`,
-    `📤 Outbound görüşülen: ${summary.outboundAnswered}`,
-    `📤 Outbound cevapsız: ${summary.outboundNoAnswer}`,
-    `🎧 Ses kaydı olan: ${summary.withRecording}`,
+    `Toplam: ${escapeHtml(String(summary.total))}`,
+    `📥 Inbound cevaplanan: ${escapeHtml(String(summary.inboundAnswered))}`,
+    `📥 Inbound kaçan: ${escapeHtml(String(summary.inboundMissed))}`,
+    `📤 Outbound görüşülen: ${escapeHtml(String(summary.outboundAnswered))}`,
+    `📤 Outbound cevapsız: ${escapeHtml(String(summary.outboundNoAnswer))}`,
+    `🎧 Ses kaydı olan: ${escapeHtml(String(summary.withRecording))}`,
     ``,
   ];
 
@@ -654,7 +889,7 @@ function buildDailyLiveCardText(dateKey, day) {
     });
   }
 
-  return truncateTelegramText(lines.join("\n"));
+  return truncateText(lines.join("\n"));
 }
 
 function buildFinalReportText(dateKey, day) {
@@ -662,15 +897,15 @@ function buildFinalReportText(dateKey, day) {
   const calls = [...(day.calls || [])].sort((a, b) => a.startAt - b.startAt);
 
   const lines = [
-    `📊 Gün Sonu Çağrı Raporu`,
-    `📅 Tarih: ${dateKey}`,
+    `📊 <b>Gün Sonu Çağrı Raporu</b>`,
+    `📅 Tarih: ${escapeHtml(dateKey)}`,
     ``,
-    `Toplam görüşme: ${summary.total}`,
-    `📥 Inbound cevaplanan: ${summary.inboundAnswered}`,
-    `📥 Inbound kaçan: ${summary.inboundMissed}`,
-    `📤 Outbound görüşülen: ${summary.outboundAnswered}`,
-    `📤 Outbound cevapsız: ${summary.outboundNoAnswer}`,
-    `🎧 Ses kaydı olan: ${summary.withRecording}`,
+    `Toplam görüşme: ${escapeHtml(String(summary.total))}`,
+    `📥 Inbound cevaplanan: ${escapeHtml(String(summary.inboundAnswered))}`,
+    `📥 Inbound kaçan: ${escapeHtml(String(summary.inboundMissed))}`,
+    `📤 Outbound görüşülen: ${escapeHtml(String(summary.outboundAnswered))}`,
+    `📤 Outbound cevapsız: ${escapeHtml(String(summary.outboundNoAnswer))}`,
+    `🎧 Ses kaydı olan: ${escapeHtml(String(summary.withRecording))}`,
     ``,
     `Detaylar:`,
     ``,
@@ -685,11 +920,11 @@ function buildFinalReportText(dateKey, day) {
     });
   }
 
-  return truncateTelegramText(lines.join("\n"));
+  return truncateText(lines.join("\n"));
 }
 
 /* =========================
-   DAILY CARD
+   DAILY CARD SEND/UPDATE
 ========================= */
 async function sendOrUpdateDailyLiveCard(dateKey) {
   const day = ensureDayStore(dateKey);
@@ -705,13 +940,17 @@ async function sendOrUpdateDailyLiveCard(dateKey) {
           CALL_TELEGRAM_BOT_TOKEN,
           chatId,
           ref.messageId,
-          text
+          text,
+          null,
+          "HTML"
         );
       } else {
         const sent = await sendTelegramMessageViaBot(
           CALL_TELEGRAM_BOT_TOKEN,
           chatId,
-          text
+          text,
+          null,
+          "HTML"
         );
 
         if (sent?.message_id) {
@@ -728,7 +967,9 @@ async function sendOrUpdateDailyLiveCard(dateKey) {
         const sent = await sendTelegramMessageViaBot(
           CALL_TELEGRAM_BOT_TOKEN,
           chatId,
-          text
+          text,
+          null,
+          "HTML"
         );
 
         if (sent?.message_id) {
@@ -763,7 +1004,7 @@ async function sendFinalReportIfDue() {
   }
 
   const text = buildFinalReportText(dateKey, day);
-  await sendCallTelegram(text);
+  await sendCallTelegram(text, null, null, "HTML");
 
   day.finalReportSent = true;
   day.finalReportSentAt = Date.now();
@@ -870,9 +1111,9 @@ async function finalizeCallRecord(source, patch = {}) {
 
     let externalTarget = "";
     if (direction === "inbound") {
-      externalTarget = normalizePhone(source.customer_num || callerRaw || "");
+      externalTarget = normalizePhone(source.customer_num || source.arayan || callerRaw || "");
     } else if (direction === "outbound") {
-      externalTarget = normalizePhone(source.customer_num || calleeRaw || "");
+      externalTarget = normalizePhone(source.customer_num || source.aranan || calleeRaw || "");
     }
 
     const contactName = getName(externalTarget);
@@ -951,47 +1192,100 @@ async function processCallTelegramMessage(update) {
         "/today_card\n" +
         "/today_report\n" +
         "/yesterday_report\n" +
-        "/reload_contacts\n\n" +
-        "/today_card -> bugünün canlı kartını yeniden yollar\n" +
-        "/today_report -> bugünün detay raporu\n" +
-        "/yesterday_report -> dünün detay raporu\n" +
-        "/reload_contacts -> rehberi yeniden yükler",
-      [chatId]
+        "/reload_contacts\n" +
+        "/open_calls\n\n" +
+        "/today_card -> bugünün canlı kartı\n" +
+        "/today_report -> bugünün raporu\n" +
+        "/yesterday_report -> dünün raporu\n" +
+        "/reload_contacts -> rehberi yeniden yükler\n" +
+        "/open_calls -> açık kaçan çağrı görevleri",
+      [chatId],
+      null,
+      "HTML"
     );
     return;
   }
 
   if (text === "/reload_contacts") {
     await refreshContactsSafe();
-    await sendCallTelegram("✅ Rehber yeniden yüklendi.", [chatId]);
+    await sendCallTelegram("✅ Rehber yeniden yüklendi.", [chatId], null, "HTML");
     return;
   }
 
   if (text === "/today_card") {
     const dateKey = await getDateKeyInTurkey();
     const day = ensureDayStore(dateKey);
-    await sendCallTelegram(buildDailyLiveCardText(dateKey, day), [chatId]);
+    await sendCallTelegram(buildDailyLiveCardText(dateKey, day), [chatId], null, "HTML");
     return;
   }
 
   if (text === "/today_report") {
     const dateKey = await getDateKeyInTurkey();
     const day = ensureDayStore(dateKey);
-    await sendCallTelegram(buildFinalReportText(dateKey, day), [chatId]);
+    await sendCallTelegram(buildFinalReportText(dateKey, day), [chatId], null, "HTML");
     return;
   }
 
   if (text === "/yesterday_report") {
     const dateKey = await getDateKeyDaysAgoTurkey(1);
     const day = ensureDayStore(dateKey);
-    await sendCallTelegram(buildFinalReportText(dateKey, day), [chatId]);
+    await sendCallTelegram(buildFinalReportText(dateKey, day), [chatId], null, "HTML");
     return;
+  }
+
+  if (text === "/open_calls") {
+    const openTasks = Object.values(callTasksMap)
+      .filter((t) => t.status === "open")
+      .sort((a, b) => b.lastCallAt - a.lastCallAt)
+      .slice(0, 30);
+
+    if (!openTasks.length) {
+      await sendCallTelegram("Açık kaçan çağrı görevi yok.", [chatId], null, "HTML");
+      return;
+    }
+
+    const lines = ["📋 <b>Açık kaçan çağrı görevleri</b>", ""];
+    for (const t of openTasks) {
+      lines.push(`• ${escapeHtml(t.name || "Kayıtlı değil")} - ${escapeHtml(t.phone || "-")} (${escapeHtml(String(t.missedCount || 1))})`);
+    }
+
+    await sendCallTelegram(lines.join("\n"), [chatId], null, "HTML");
   }
 }
 
 async function processCallTelegramCallback(update) {
   const callback = update.callback_query;
   if (!callback) return;
+
+  const chatId = String(callback.message?.chat?.id || "");
+  if (!isAllowedCallTelegramChat(chatId)) {
+    await answerCallCallback(callback.id, "Yetkisiz");
+    return;
+  }
+
+  const data = callback.data || "";
+  const parts = data.split("|");
+
+  if (parts.length === 3 && parts[0] === "calltask") {
+    const newStatus = parts[1];
+    const taskId = parts[2];
+    const task = callTasksMap[taskId];
+
+    if (!task) {
+      await answerCallCallback(callback.id, "Görev bulunamadı");
+      return;
+    }
+
+    task.status = newStatus;
+    task.updatedAt = Date.now();
+    task.updatedBy = formatTelegramUser(callback.from);
+
+    saveCallTasks();
+    await syncMissedCallTaskMessages(task);
+    await answerCallCallback(callback.id, `Durum güncellendi: ${getTaskStatusLabel(newStatus)}`);
+    return;
+  }
+
   await answerCallCallback(callback.id);
 }
 
@@ -1011,7 +1305,6 @@ async function checkTelegram(botName, botToken, state, onUpdate) {
       logError(`${botName} update hatası: aynı bot başka instance tarafından kullanılıyor.`);
       return;
     }
-
     logError(`${botName} update hatası:`, data);
     return;
   }
@@ -1122,6 +1415,51 @@ function startSelfPing() {
 }
 
 /* =========================
+   RECORDING PROXY
+========================= */
+app.get("/recording/:callId", async (req, res) => {
+  try {
+    const callId = String(req.params.callId || "").trim();
+    if (!callId) {
+      return res.status(400).send("missing call id");
+    }
+
+    let found = null;
+    for (const day of Object.values(callStore)) {
+      const match = (day.calls || []).find((c) => c.uniqueId === callId && c.recording);
+      if (match) {
+        found = match;
+        break;
+      }
+    }
+
+    if (!found || !found.recording) {
+      return res.status(404).send("recording not found");
+    }
+
+    const upstream = await fetch(found.recording, {
+      method: "GET",
+      redirect: "follow",
+    });
+
+    if (!upstream.ok) {
+      return res.status(502).send("upstream recording fetch failed");
+    }
+
+    const contentType = upstream.headers.get("content-type") || "audio/mpeg";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", 'inline; filename="recording.mp3"');
+    res.setHeader("Cache-Control", "private, max-age=300");
+
+    const arrayBuffer = await upstream.arrayBuffer();
+    return res.status(200).send(Buffer.from(arrayBuffer));
+  } catch (e) {
+    logError("recording proxy hatası:", e.message);
+    return res.status(500).send("recording proxy error");
+  }
+});
+
+/* =========================
    DEBUG
 ========================= */
 app.all("/call-webhook-test", (req, res) => {
@@ -1188,6 +1526,7 @@ app.post("/call-webhook", async (req, res) => {
     if (scenario === "Hangup") {
       const state = getCallState(uniqueId);
       const direction = state?.type || inferDirection(data);
+      const answered = Boolean(state?.answered || Number(data.talktime || 0) > 0);
 
       await finalizeCallRecord(
         {
@@ -1196,7 +1535,7 @@ app.post("/call-webhook", async (req, res) => {
         },
         {
           direction,
-          answered: Boolean(state?.answered || Number(data.talktime || 0) > 0),
+          answered,
           caller:
             direction === "inbound"
               ? (data.customer_num || data.arayan || "")
@@ -1213,6 +1552,21 @@ app.post("/call-webhook", async (req, res) => {
         }
       );
 
+      if (direction === "inbound" && !answered) {
+        const missedPhone = normalizePhone(data.customer_num || data.arayan || "");
+        if (missedPhone) {
+          const { task, changed } = await createOrUpdateDailyMissedCallTask(missedPhone, uniqueId, {
+            lastRecordingUniqueId: uniqueId,
+          });
+
+          if (changed) {
+            await sendMissedCallTaskNotifications(task);
+          } else {
+            await syncMissedCallTaskMessages(task);
+          }
+        }
+      }
+
       deleteCallState(uniqueId);
       return;
     }
@@ -1224,6 +1578,8 @@ app.post("/call-webhook", async (req, res) => {
           : String(data.yon || "") === "2"
           ? "outbound"
           : inferDirection(data);
+
+      const answered = Number(data.sure || 0) > 0 || String(data.callConnectedTime || "") !== "";
 
       const caller =
         direction === "inbound"
@@ -1247,7 +1603,7 @@ app.post("/call-webhook", async (req, res) => {
         },
         {
           direction,
-          answered: Number(data.sure || 0) > 0 || String(data.callConnectedTime || "") !== "",
+          answered,
           caller,
           callee,
           internal,
@@ -1259,6 +1615,21 @@ app.post("/call-webhook", async (req, res) => {
           rawScenario: "cdr",
         }
       );
+
+      if (direction === "inbound" && !answered) {
+        const missedPhone = normalizePhone(data.arayan || data.customer_num || "");
+        if (missedPhone) {
+          const { task, changed } = await createOrUpdateDailyMissedCallTask(missedPhone, uniqueId, {
+            lastRecordingUniqueId: sanitizeRecording(data.seskaydi || "") ? uniqueId : "",
+          });
+
+          if (changed) {
+            await sendMissedCallTaskNotifications(task);
+          } else {
+            await syncMissedCallTaskMessages(task);
+          }
+        }
+      }
 
       deleteCallState(uniqueId);
       return;
@@ -1292,6 +1663,7 @@ async function bootstrap() {
 
   loadCallStore();
   loadDailyCardRefs();
+  loadCallTasks();
 
   await refreshTurkeyTimeOffset();
   await refreshContactsSafe();
